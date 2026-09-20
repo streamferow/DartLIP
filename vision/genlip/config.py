@@ -33,10 +33,7 @@ class ModelConfig:
 
 @dataclass
 class DARTConfig:
-    image_size: tuple[int, int]
     patch_size: tuple[int, int]
-    grid: tuple[int, int]
-    num_patches: int
     stride: int
     in_channels: int
     embedding_dim: int
@@ -44,6 +41,20 @@ class DARTConfig:
     input_dim: int
     hidden_size: int
     output_dim: int
+
+    # Stage 1: fixed resolution
+    image_size: tuple[int, int] | None = None
+    grid: tuple[int, int] | None = None
+    num_patches: int | None = None
+
+    # Stage 2: variable resolution (AnyRes)
+    reference_image_size: tuple[int, int] = (224, 224)
+    min_patches: int = 16
+    max_patches: int = 1024
+
+    @property
+    def variable_resolution(self) -> bool:
+        return self.grid is None
 
 
 @dataclass
@@ -53,7 +64,6 @@ class DataConfig:
     train_split: str
     eval_split: str
     caption_column: str
-    image_size: int
     tokenizer_name: str
     max_text_length: int
 
@@ -61,6 +71,15 @@ class DataConfig:
     num_workers: int
     pin_memory: bool
     drop_last: bool
+
+    # Stage 1
+    image_size: int | None = None
+
+    # Stage 2
+    native_aspect_ratio: bool = False
+    min_patches: int = 16
+    max_patches: int = 1024
+    max_packing_length: int = 16384
 
 
 @dataclass
@@ -101,6 +120,7 @@ class ParallelConfig:
 @dataclass
 class Config:
     seed: int
+    stage: int
     model: ModelConfig
     dart: DARTConfig
     data: DataConfig
@@ -117,8 +137,47 @@ def _resolve_path(path: str) -> str:
     return str((REPO_ROOT / p).resolve())
 
 
+def _load_dart_config(dart_raw: dict) -> DARTConfig:
+    dart_raw = dict(dart_raw)
+    dart_raw["patch_size"] = tuple(dart_raw["patch_size"])
+    if "image_size" in dart_raw:
+        dart_raw["image_size"] = tuple(dart_raw["image_size"])
+    if "grid" in dart_raw:
+        dart_raw["grid"] = tuple(dart_raw["grid"])
+    if "reference_image_size" in dart_raw:
+        dart_raw["reference_image_size"] = tuple(dart_raw["reference_image_size"])
+    return DARTConfig(**dart_raw)
+
+
+def _validate_stage1(model: ModelConfig, dart: DARTConfig, data: DataConfig) -> None:
+    assert dart.image_size is not None and dart.grid is not None and dart.num_patches is not None
+    assert dart.num_patches == dart.grid[0] * dart.grid[1]
+    assert data.image_size is not None
+    assert data.image_size == dart.image_size[0] == dart.image_size[1]
+    assert model.patch_size == dart.patch_size[0] == dart.patch_size[1]
+    assert model.hidden_size == dart.embedding_dim
+    assert model.num_channels == dart.in_channels
+    assert (data.image_size // model.patch_size) ** 2 == dart.num_patches
+    assert dart.grid[0] % model.spatial_merge_size == 0
+    assert dart.grid[1] % model.spatial_merge_size == 0
+    merged_patches = (dart.grid[0] // model.spatial_merge_size) * (dart.grid[1] // model.spatial_merge_size)
+    assert dart.num_patches // (model.spatial_merge_size ** 2) == merged_patches
+
+
+def _validate_stage2(model: ModelConfig, dart: DARTConfig, data: DataConfig) -> None:
+    assert dart.variable_resolution
+    assert model.patch_size == dart.patch_size[0] == dart.patch_size[1]
+    assert model.hidden_size == dart.embedding_dim
+    assert model.num_channels == dart.in_channels
+    assert dart.min_patches == data.min_patches
+    assert dart.max_patches == data.max_patches
+    assert data.native_aspect_ratio
+    assert data.max_packing_length <= model.max_position_embeddings
+
+
 def load_config(path: str | Path) -> Config:
     raw = yaml.safe_load(Path(path).read_text())
+    stage = int(raw.get("stage", 1))
 
     model_raw = dict(raw["model"])
     model_raw["mrope_sections"] = tuple(model_raw["mrope_sections"])
@@ -131,24 +190,16 @@ def load_config(path: str | Path) -> Config:
     data_raw = dict(raw["data"])
     data_raw["cache_dir"] = _resolve_path(data_raw["cache_dir"])
 
-    dart_raw = dict(raw["dart"])
-    dart_raw["image_size"] = tuple(dart_raw["image_size"])
-    dart_raw["patch_size"] = tuple(dart_raw["patch_size"])
-    dart_raw["grid"] = tuple(dart_raw["grid"])
-    assert dart_raw["num_patches"] == dart_raw["grid"][0] * dart_raw["grid"][1]
-
+    dart = _load_dart_config(raw["dart"])
     model = ModelConfig(**model_raw)
-    dart = DARTConfig(**dart_raw)
     data = DataConfig(**data_raw)
-    assert data.image_size == dart.image_size[0] == dart.image_size[1]
-    assert model.patch_size == dart.patch_size[0] == dart.patch_size[1]
-    assert model.hidden_size == dart.embedding_dim
-    assert model.num_channels == dart.in_channels
-    assert (data.image_size // model.patch_size) ** 2 == dart.num_patches
-    assert dart.grid[0] % model.spatial_merge_size == 0
-    assert dart.grid[1] % model.spatial_merge_size == 0
-    merged_patches = (dart.grid[0] // model.spatial_merge_size) * (dart.grid[1] // model.spatial_merge_size)
-    assert dart.num_patches // (model.spatial_merge_size ** 2) == merged_patches
+
+    if stage == 1:
+        _validate_stage1(model, dart, data)
+    elif stage == 2:
+        _validate_stage2(model, dart, data)
+    else:
+        raise ValueError(f"Unknown stage={stage}; expected 1 or 2")
 
     optimizer_raw = dict(raw["optimizer"])
     optimizer_raw["learning_rate"] = float(optimizer_raw["learning_rate"])
@@ -165,6 +216,7 @@ def load_config(path: str | Path) -> Config:
 
     return Config(
         seed=raw["seed"],
+        stage=stage,
         model=model,
         dart=dart,
         data=data,

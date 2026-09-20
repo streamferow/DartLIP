@@ -13,18 +13,20 @@ from vision.tokenizer.dart import build_dart
 from .config import DARTConfig, ModelConfig
 
 
+def _is_low_end_gpu() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 0)
+
+
 def _flex_attention_block_size() -> int:
-    if torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 0):
-        return 64
+    if _is_low_end_gpu():
+        return 32
     return 128
 
 
 def _build_flex_attention():
-    if not torch.cuda.is_available():
+    if not torch.cuda.is_available() or _is_low_end_gpu():
         return flex_attention
-    if torch.cuda.get_device_capability() >= (8, 0):
-        return torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
-    return torch.compile(flex_attention, dynamic=False, mode="default")
+    return torch.compile(flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 
 class SpatialMerger(nn.Module):
@@ -466,13 +468,224 @@ class GenLIP(nn.Module):
         return {"block_mask": block_mask, "max_seqlen": padded_seq_len}
 
 
-    def forward(
+    def _build_packed_prefix_lm_flex_args(
         self,
-        pixel_values: torch.Tensor,
+        segment_vision_lengths: list[int],
+        segment_text_lengths: list[int],
+        seq_len: int,
+        device: torch.device,
+        block_size: int | None = None,
+    ) -> dict:
+        block_size = block_size or _flex_attention_block_size()
+        if seq_len > self.max_position_embeddings:
+            raise ValueError(
+                f"seq_len={seq_len} > max_position_embeddings={self.max_position_embeddings}"
+            )
+
+        pad_length = calculate_pad_length(seq_len, block_size)
+        padded_seq_len = seq_len + pad_length
+        if padded_seq_len > self.max_position_embeddings:
+            raise ValueError(
+                f"padded_seq_len={padded_seq_len} > max_position_embeddings={self.max_position_embeddings}"
+            )
+
+        num_segments = len(segment_vision_lengths)
+        segment_starts: list[int] = [0]
+        segment_ends: list[int] = []
+        offset = 0
+        for vision_len, text_len in zip(segment_vision_lengths, segment_text_lengths):
+            offset += vision_len + text_len
+            segment_ends.append(offset)
+        segment_starts.extend(segment_ends[:-1])
+
+        end_scalars = [torch.tensor(end, device=device, dtype=torch.long) for end in segment_ends]
+        start_scalars = [torch.tensor(start, device=device, dtype=torch.long) for start in segment_starts]
+        vision_scalars = [
+            torch.tensor(v, device=device, dtype=torch.long) for v in segment_vision_lengths
+        ]
+
+        def segment_id(idx: torch.Tensor) -> torch.Tensor:
+            seg = torch.zeros_like(idx)
+            for end in end_scalars:
+                seg = seg + (idx >= end).long()
+            return seg
+
+        def segment_start(idx: torch.Tensor) -> torch.Tensor:
+            start = torch.zeros_like(idx)
+            for i in range(1, num_segments):
+                start = start + (segment_id(idx) >= i).long() * start_scalars[i]
+            return start
+
+        def segment_vision_len(idx: torch.Tensor) -> torch.Tensor:
+            vision_len = vision_scalars[0].expand_as(idx)
+            for i in range(1, num_segments):
+                vision_len = torch.where(
+                    segment_id(idx) >= i,
+                    vision_scalars[i].expand_as(idx),
+                    vision_len,
+                )
+            return vision_len
+
+        def packed_prefix_lm(batch_idx, head_idx, query_idx, key_idx):
+            real_query = query_idx < seq_len
+            real_key = key_idx < seq_len
+
+            seg_q = segment_id(query_idx)
+            seg_k = segment_id(key_idx)
+            same_segment = seg_q == seg_k
+
+            local_q = query_idx - segment_start(query_idx)
+            local_k = key_idx - segment_start(key_idx)
+            vision_len = segment_vision_len(query_idx)
+
+            query_is_vision = local_q < vision_len
+            key_is_vision = local_k < vision_len
+            query_is_text = local_q >= vision_len
+            key_is_text = local_k >= vision_len
+
+            vision_attends_vision = query_is_vision & key_is_vision
+            text_attends_vision = query_is_text & key_is_vision
+            text_attends_text = query_is_text & key_is_text & (local_k <= local_q)
+
+            allowed = vision_attends_vision | text_attends_vision | text_attends_text
+            return real_query & real_key & same_segment & allowed
+
+        block_mask = create_block_mask(
+            packed_prefix_lm,
+            B=None,
+            H=None,
+            Q_LEN=padded_seq_len,
+            KV_LEN=padded_seq_len,
+            device=device,
+            BLOCK_SIZE=block_size,
+        )
+        return {"block_mask": block_mask, "max_seqlen": padded_seq_len}
+
+
+    def _forward_packed(
+        self,
+        pixel_values_list: list[torch.Tensor],
         input_ids: torch.Tensor,
         labels: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        segment_vision_lengths: list[int] | None = None,
+        segment_text_lengths: list[int] | None = None,
     ) -> dict[str, torch.Tensor]:
+        if segment_vision_lengths is None or segment_text_lengths is None:
+            raise ValueError("segment_vision_lengths and segment_text_lengths are required for packed forward")
+
+        device = input_ids.device
+        flat_input_ids = input_ids.squeeze(0)
+        flat_attention_mask = attention_mask.squeeze(0) if attention_mask is not None else None
+        flat_labels = labels.squeeze(0) if labels is not None else None
+
+        hidden_parts: list[torch.Tensor] = []
+        position_parts: list[torch.Tensor] = []
+        text_indices: list[int] = []
+        label_parts: list[torch.Tensor] = []
+
+        text_offset = 0
+        seq_offset = 0
+        for pixel_values, vision_len, text_len in zip(
+            pixel_values_list, segment_vision_lengths, segment_text_lengths
+        ):
+            pixel_values = pixel_values.unsqueeze(0)
+            _, _, height, width = pixel_values.shape
+            grid_h = height // self.patch_size
+            grid_w = width // self.patch_size
+
+            if self.use_dart:
+                vision, patch_centers = self.vision_embeddings(pixel_values)
+            else:
+                vision = self.vision_embeddings(pixel_values)
+                patch_centers = None
+            vision = self.spatial_merger(vision, grid_h, grid_w)
+
+            segment_input_ids = flat_input_ids[text_offset : text_offset + text_len].unsqueeze(0)
+            segment_attention_mask = None
+            if flat_attention_mask is not None:
+                segment_attention_mask = flat_attention_mask[text_offset : text_offset + text_len].unsqueeze(0)
+            text = self.text_embeddings(segment_input_ids)
+
+            position_ids = self._build_fused_position_ids(
+                1,
+                height,
+                width,
+                text_len,
+                device,
+                segment_attention_mask,
+                patch_centers=patch_centers,
+            )
+
+            hidden_parts.append(torch.cat([vision.squeeze(0), text.squeeze(0)], dim=0))
+            position_parts.append(position_ids.squeeze(1))
+            text_indices.extend(range(seq_offset + vision_len, seq_offset + vision_len + text_len))
+            if flat_labels is not None:
+                label_parts.append(flat_labels[text_offset : text_offset + text_len])
+
+            text_offset += text_len
+            seq_offset += vision_len + text_len
+
+        hidden = torch.cat(hidden_parts, dim=0).unsqueeze(0)
+        position_ids = torch.cat(position_parts, dim=-1).unsqueeze(1)
+        seq_len = hidden.shape[1]
+
+        frequencies_complex = build_mrope_frequencies(
+            position_ids,
+            head_dim=self.head_dim,
+            theta=self.config.mrope_theta,
+            mrope_sections=self.config.mrope_sections,
+        )
+        flex_attention_args = self._build_packed_prefix_lm_flex_args(
+            segment_vision_lengths,
+            segment_text_lengths,
+            seq_len,
+            device,
+        )
+        hidden = self.encoder(
+            input_embeddings=hidden,
+            frequencies_complex=frequencies_complex,
+            attention_mask=None,
+            flex_attention_args=flex_attention_args,
+        )
+        hidden = self.ln_post(hidden)
+
+        text_hidden = hidden[:, text_indices, :]
+        logits = self.lm_head(text_hidden)
+
+        out: dict[str, torch.Tensor] = {"logits": logits}
+        if labels is not None and label_parts:
+            packed_labels = torch.cat(label_parts, dim=0).unsqueeze(0)
+            shift_logits = logits[:, :-1].contiguous()
+            shift_labels = packed_labels[:, 1:].contiguous()
+            loss = self.loss_fct(
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+            )
+            out["loss"] = loss
+            out["ce"] = loss
+        return out
+
+    def forward(
+        self,
+        pixel_values: torch.Tensor | None = None,
+        input_ids: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        pixel_values_list: list[torch.Tensor] | None = None,
+        segment_vision_lengths: list[int] | None = None,
+        segment_text_lengths: list[int] | None = None,
+    ) -> dict[str, torch.Tensor]:
+        if pixel_values_list is not None:
+            return self._forward_packed(
+                pixel_values_list=pixel_values_list,
+                input_ids=input_ids,
+                labels=labels,
+                attention_mask=attention_mask,
+                segment_vision_lengths=segment_vision_lengths,
+                segment_text_lengths=segment_text_lengths,
+            )
+
         _, _, height, width = pixel_values.shape
         grid_h = height // self.patch_size
         grid_w = width // self.patch_size

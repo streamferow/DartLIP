@@ -59,9 +59,26 @@ class Trainer:
             self.config.max_grad_norm,
         )
 
+    def _to_device(self, batch: dict) -> dict:
+        moved = {}
+        for key, value in batch.items():
+            if key == "pixel_values_list":
+                moved[key] = [item.to(self.device, non_blocking=True) for item in value]
+            elif isinstance(value, torch.Tensor):
+                moved[key] = value.to(self.device, non_blocking=True)
+            else:
+                moved[key] = value
+        return moved
+
     def train_step(self, batch):
         self.model.train()
-        batch = {k: v.to(self.device, non_blocking=True) for k, v in batch.items()}
+        batch = self._to_device(batch)
+        if "input_ids" in batch and batch["input_ids"].dim() == 1:
+            batch["input_ids"] = batch["input_ids"].unsqueeze(0)
+        if "attention_mask" in batch and batch["attention_mask"].dim() == 1:
+            batch["attention_mask"] = batch["attention_mask"].unsqueeze(0)
+        if "labels" in batch and batch["labels"].dim() == 1:
+            batch["labels"] = batch["labels"].unsqueeze(0)
         out = self.model(**batch)
         loss = out["loss"] / self.config.gradient_accumulation_steps
         loss.backward()

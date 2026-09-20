@@ -25,7 +25,7 @@ def main(config_path: str):
     model = apply_hsdp(model, mesh, bf16=config.parallel.bf16)
 
     loader = build_dataloader(
-        config.data,
+        config,
         tokenizer,
         split=config.data.train_split,
         rank=rank,
@@ -37,7 +37,16 @@ def main(config_path: str):
 
     if is_main_process():
         dp_size = world_size
+        stage_info = (
+            f"fixed {config.dart.num_patches} patches @ {config.data.image_size}px"
+            if config.stage == 1
+            else (
+                f"AnyRes patches [{config.dart.min_patches}, {config.dart.max_patches}], "
+                f"pack_len={config.data.max_packing_length}"
+            )
+        )
         print(
+            f"stage {config.stage}: {stage_info}\n"
             f"training on {world_size} GPU(s): "
             f"replicate={config.parallel.replicate}, shard={config.parallel.shard}, "
             f"batch_size={config.data.batch_size}/gpu, "
@@ -60,5 +69,5 @@ def main(config_path: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", default="vision/config.yaml")
+    parser.add_argument("--config", default="vision/config_stage1.yaml")
     main(parser.parse_args().config)

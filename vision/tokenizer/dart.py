@@ -323,17 +323,23 @@ class DART(nn.Module):
     def __init__(self, config: DARTConfig):
         super().__init__()
         self.config = config
-        self.image_size = config.image_size
         self.patch_size = config.patch_size
         self.patch_h, self.patch_w = config.patch_size
-        self.grid = config.grid
-        self.grid_h, self.grid_w = config.grid
-        self.num_patches = config.num_patches
         self.stride = config.stride
+        self.variable_resolution = config.variable_resolution
 
-        assert self.num_patches == self.grid_h * self.grid_w, (f"num_patches={self.num_patches} != grid {self.grid_h}x{self.grid_w}")
-        assert self.image_size[0] == self.grid_h * self.patch_h
-        assert self.image_size[1] == self.grid_w * self.patch_w
+        if self.variable_resolution:
+            self.reference_image_size = config.reference_image_size
+            self.min_patches = config.min_patches
+            self.max_patches = config.max_patches
+        else:
+            self.image_size = config.image_size
+            self.grid = config.grid
+            self.grid_h, self.grid_w = config.grid
+            self.num_patches = config.num_patches
+            assert self.num_patches == self.grid_h * self.grid_w
+            assert self.image_size[0] == self.grid_h * self.patch_h
+            assert self.image_size[1] == self.grid_w * self.patch_w
 
         features = build_dart_features(config)
         self.score_prediction_network = DARTScorePredictionNetwork(config, features)
@@ -344,28 +350,44 @@ class DART(nn.Module):
             stride=1,
         )
 
+    def _grid_for_input(self, height: int, width: int) -> tuple[int, int, int]:
+        grid_h = height // self.patch_h
+        grid_w = width // self.patch_w
+        num_patches = grid_h * grid_w
+        if self.variable_resolution:
+            if num_patches < self.min_patches or num_patches > self.max_patches:
+                raise ValueError(
+                    f"patch count {num_patches} outside [{self.min_patches}, {self.max_patches}] "
+                    f"for input {height}x{width}"
+                )
+        return grid_h, grid_w, num_patches
+
     def forward(
         self,
         x: torch.Tensor,  # (B, C, H, W)
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, channels, height, width = x.shape
         patch_h, patch_w = self.patch_h, self.patch_w
-        
+        grid_h, grid_w, num_patches = self._grid_for_input(height, width)
+
+        score_image_size = self.reference_image_size if self.variable_resolution else self.image_size
+        score_grid = (grid_h, grid_w)
+
         # B, C, Hp, Wp
-        interpolated_x = F.interpolate(x, size=self.image_size, mode="bilinear", align_corners=False)
+        interpolated_x = F.interpolate(x, size=score_image_size, mode="bilinear", align_corners=False)
         # B, N = Hp * Wp * C
-        scores = self.score_prediction_network(interpolated_x, shape=self.grid)
+        scores = self.score_prediction_network(interpolated_x, shape=score_grid)
         pdf = scores / scores.sum(dim=1, keepdim=True)
-        
+
         # B, target_rows
-        row_heights = pdf_to_row_heights(pdf, height, target_rows=self.grid_h)
+        row_heights = pdf_to_row_heights(pdf, height, target_rows=grid_h)
         pdf = resample_tokens_by_heights(
             pdf.unsqueeze(-1),
             row_heights,
-            org_h=self.grid_h,
-            org_w=self.grid_w,
+            org_h=grid_h,
+            org_w=grid_w,
         ).squeeze(-1)
-        new_edges = get_edges_from_pdf(pdf, new_seqlen=self.num_patches)
+        new_edges = get_edges_from_pdf(pdf, new_seqlen=num_patches)
         scale = (height * row_heights.size(1)) / new_edges[:, -1].clamp(min=1e-8)
         new_edges = new_edges * scale.unsqueeze(1)
 
@@ -375,9 +397,9 @@ class DART(nn.Module):
             new_edges,
             shape=(patch_h, patch_w),
         )
-        patch_tokens = patches.reshape(batch_size * self.num_patches, channels, patch_h, patch_w)
+        patch_tokens = patches.reshape(batch_size * num_patches, channels, patch_h, patch_w)
         embeddings = self.projection(patch_tokens)
-        embeddings = embeddings.flatten(1).view(batch_size, self.num_patches, self.config.embedding_dim)
+        embeddings = embeddings.flatten(1).view(batch_size, num_patches, self.config.embedding_dim)
         patch_centers = compute_patch_centers_in_image(row_heights, new_edges, width)
         return embeddings, patch_centers
 

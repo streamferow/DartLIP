@@ -1,8 +1,8 @@
 # DartLIP
 
-Vision-language модель для генерации подписей к изображениям. **DART** — визуальный энкодер: он вырезает патчи с content-aware деформацией сетки. **GenLIP** принимает эти токены, склеивает их с текстом и предсказывает следующий токен подписи.
+**DartLIP** — визуальный энкодер на базе **DART** (Dynamic Adaptive Resampling Tokenizer). Он вырезает патчи с content-aware деформацией сетки и отдаёт vision-токены с пространственными центроидами.
 
-Обучение идёт в два этапа: сначала фиксированное разрешение, затем native aspect ratio и упаковка нескольких пар «картинка + подпись» в одну последовательность.
+В этом репозитории энкодер обучается через captioning: **GenLIP** выступает обучающим каркасом — склеивает vision-токены с текстом и даёт сигнал next-token loss. После обучения DartLIP интегрируется во внешнюю VLM вместо стандартного patch embedding.
 
 ---
 
@@ -10,8 +10,8 @@ Vision-language модель для генерации подписей к из�
 
 - [Архитектура](#архитектура)
 - [Два этапа обучения](#два-этапа-обучения)
-- [DART](#dart)
-- [GenLIP](#genlip)
+- [DART — визуальный энкодер](#dart--визуальный-энкодер)
+- [GenLIP — обучающий каркас](#genlip--обучающий-каркас)
 - [Обучение](#обучение)
 - [Запуск](#запуск)
 - [Структура репозитория](#структура-репозитория)
@@ -25,7 +25,7 @@ flowchart TB
     IMG["Изображение"] --> DART
     CAP["Подпись · Qwen3 tokenizer"] --> TEXT["Text embedding"]
 
-    subgraph DART["DART"]
+    subgraph DartLIP["DartLIP (визуальный энкодер)"]
         SN["ScoreNet\nMobileNetV3 + MLP"] --> PDF["PDF → row heights → edges"]
         PDF --> SAMPLE["grid_sample · патчи 16×16"]
         SAMPLE --> PROJ["Conv2d → 1152d"]
@@ -39,17 +39,19 @@ flowchart TB
     FUSE --> ENC["GenLIP encoder · 27 слоёв\nprefix-LM · flex attention"]
     ROPE --> ENC
     ENC --> HEAD["LM head"]
-    HEAD --> LOSS["Cross-entropy\nnext token"]
+    HEAD --> LOSS["Cross-entropy\nnext-token loss"]
+
+    PROJ -.->|"после обучения"| VLM["Внешняя VLM"]
 ```
 
-| Компонент | Что делает |
+| Компонент | Роль |
 |---|---|
-| **DART** | Визуальный энкодер: оценивает важность областей и перераспределяет патчи |
-| **GenLIP** | Общий transformer для vision- и text-токенов, LM head только на тексте |
-| **mRoPE** | 3D-позиции `(t, h, w)`: для патчей — реальные центроиды, для текста — 1D со сдвигом |
-| **Prefix-LM** | Патчи видят друг друга полностью, текст смотрит на патчи и на предыдущие токены |
+| **DartLIP (DART)** | Визуальный энкодер — продукт репозитория |
+| **GenLIP** | Обучающий каркас: fusion, transformer, LM head для captioning |
+| **mRoPE** | 3D-позиции `(t, h, w)`: для патчей — центроиды, для текста — 1D со сдвигом |
+| **Prefix-LM** | Маска внимания на время обучения: патчи ↔ патчи, текст → патчи + causal text |
 
-Размерность по умолчанию: `hidden_size = 1152`, 16 голов, `head_dim = 72`, 27 слоёв, словарь Qwen3 (`151936`).
+Размерность vision-токенов: `1152`. GenLIP-энкодер: 16 голов, `head_dim = 72`, 27 слоёв.
 
 ---
 
@@ -58,20 +60,20 @@ flowchart TB
 | | Stage 1 | Stage 2 |
 |---|---|---|
 | Конфиг | [`vision/config_stage1.yaml`](vision/config_stage1.yaml) | [`vision/config_stage2.yaml`](vision/config_stage2.yaml) |
-| Изображение | квадрат 224×224 | исходное соотношение сторон |
+| Изображение | квадрат 224×224 | native aspect ratio |
 | Патчи | ровно 196 (сетка 14×14) | от 16 до 1024 |
 | Текст | до 128 токенов | до 512 токенов |
 | Батч | обычный collate | patch-n-pack, `batch_size = 1` |
 | Длина последовательности | до 4096 | до 16384 |
 | Learning rate | `1e-5` | `1e-4` |
 
-На втором этапе несколько примеров склеиваются в одну последовательность, пока суммарная длина (патчи + текст) не превысит `max_packing_length`. Attention между разными примерами в паке запрещён.
+Stage 1 — warm-up на фиксированном разрешении. Stage 2 — variable resolution и упаковка нескольких пар «картинка + подпись» в одну последовательность (patch-n-pack). Attention между разными примерами в паке запрещён.
 
 ---
 
-## DART
+## DART — визуальный энкодер
 
-Визуальный энкодер. Реализация: [`vision/tokenizer/dart.py`](vision/tokenizer/dart.py)
+Реализация: [`vision/tokenizer/dart.py`](vision/tokenizer/dart.py)
 
 ```
 изображение (B, 3, H, W)
@@ -93,29 +95,31 @@ MLP 960 → 96 → 1  →  скоры на сетке патчей
 grid_sample  →  (B, N, 3, 16, 16)
         │
         ▼
-Conv2d 3 → 1152  →  токены и центроиды (y, x)
+Conv2d 3 → 1152  →  vision-токены + центроиды (y, x)
 ```
 
 Скоры считаются на опорном размере (224×224 на stage 2, сам вход на stage 1), затем интерполируются на сетку `H/16 × W/16`. Число патчей на stage 1 фиксировано. На stage 2 оно следует за размером картинки после `resize_for_patch_budget`.
 
 Backbone MobileNet во время обучения держится в `eval`: dropout выключен, BatchNorm использует накопленную статистику. Веса при этом остаются в оптимизаторе вместе с остальной моделью.
 
+**Выход энкодера:** `(B, N, 1152)` vision-токены и `(B, N, 2)` центроиды патчей для mRoPE.
+
 ---
 
-## GenLIP
+## GenLIP — обучающий каркас
 
 Реализация: [`vision/genlip/model.py`](vision/genlip/model.py)
 
-### Forward
+GenLIP не является целевой моделью. Он нужен, чтобы дать энкодеру сигнал через captioning:
 
-1. DART возвращает vision-токены и центроиды патчей.
-2. `SpatialMerger` сжимает соседние патчи, если `spatial_merge_size > 1`. В конфигах он равен 1, слой пропускает токены как есть.
-3. Текст эмбеддится и конкатенируется после vision-префикса.
-4. Позиции mRoPE и prefix-LM маска строятся по длине префикса.
-5. Энкодер, финальный LayerNorm, LM head только на текстовых позициях.
-6. Loss — next-token cross-entropy. Паддинг в метках равен `-100` и не входит в loss.
+1. DART возвращает vision-токены и центроиды.
+2. Текст эмбеддится и конкатенируется после vision-префикса (early fusion).
+3. Общий transformer с prefix-LM маской и interleaved mRoPE обрабатывает последовательность.
+4. LM head предсказывает следующий токен подписи → cross-entropy loss.
 
-### Prefix-LM
+Градиенты текут через DART end-to-end. После обучения веса DART (`score_prediction_network` + `projection`) забираются во внешнюю VLM.
+
+### Prefix-LM (на время обучения)
 
 ```
          key →
@@ -124,29 +128,17 @@ query  vision   full     —
        text     full     causal
 ```
 
-Патчи видят только другие патчи. Текст видит все патчи своего примера и предыдущие текстовые токены.
-
-Маска собирается через `create_block_mask`. Последовательность паддится до кратности блока flex attention: 128 на GPU с compute capability ≥ 8, иначе 32. В packed-режиме то же правило действует внутри каждого сегмента, чужие сегменты невидимы.
-
 ### Interleaved mRoPE
 
 Реализация: [`vision/genlip/interleaved_mrope.py`](vision/genlip/interleaved_mrope.py)
 
-Частоты чередуются по осям `(t, h, w)`:
-
 - vision — `(t = 0, h = y_center / 16, w = x_center / 16)` по центроидам DART;
-- text — одна и та же 1D-позиция на всех трёх осях, со сдвигом `max(grid_h, grid_w)`.
+- text — 1D-позиция на всех трёх осях, со сдвигом `max(grid_h, grid_w)`.
 
 ```yaml
 mrope_sections: [12, 12, 12]   # 36 полос на head_dim = 72
 mrope_theta: 10000.0
 ```
-
-Q и K вращаются этими частотами. У query-проекции удвоенная ширина: вторая половина — sigmoid-гейт на выходе attention.
-
-### Слой энкодера
-
-Pre-norm, gated attention, SwiGLU (`3072`), layer scale (`0.1`) и DropPath (`0.1`). На энкодере включён gradient checkpointing.
 
 ---
 
@@ -195,10 +187,10 @@ DartLIP/
 │   ├── config_stage2.yaml          # AnyRes + patch-n-pack
 │   ├── genlip/
 │   │   ├── config.py               # dataclasses и load_config
-│   │   ├── model.py                # GenLIP, fusion, prefix-LM, LM head
+│   │   ├── model.py                # GenLIP — обучающий каркас
 │   │   └── interleaved_mrope.py    # частоты mRoPE и rotary на Q/K
 │   ├── tokenizer/
-│   │   └── dart.py                 # ScoreNet, warp, выборка патчей
+│   │   └── dart.py                 # DART — визуальный энкодер
 │   └── train/
 │       ├── train.py                # entry point
 │       ├── data.py                 # датасет и packing

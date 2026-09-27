@@ -20,44 +20,35 @@
 
 ## Архитектура
 
+Схемы повторяют `DART.forward` и `GenLIP.forward`.
+
+**DartLIP** — [`vision/tokenizer/dart.py`](vision/tokenizer/dart.py)
+
 ```mermaid
-%%{init: {"theme": "base", "themeVariables": {"fontFamily": "ui-sans-serif, system-ui, sans-serif", "fontSize": "15px", "lineColor": "#64748b", "textColor": "#0f172a"}, "flowchart": {"curve": "basis", "padding": 14, "nodeSpacing": 32, "rankSpacing": 40}}}%%
-flowchart TB
-    IMG(["Изображение"]) --> SN
-
-    subgraph dartlip ["DartLIP · визуальный энкодер"]
-        direction TB
-        SN["ScoreNet<br/>MobileNetV3 + MLP"] --> PDF["PDF<br/>границы патчей"]
-        PDF --> PATCH["Патчи 16×16"]
-        PATCH --> TOK["Токены 1152"]
-        PDF --> CTR["Центроиды"]
-    end
-
-    CAP(["Подпись"]) --> FUSE
-    TOK --> FUSE
-    CTR --> ROPE
-    TOK -.->|"после обучения"| VLM(["Внешняя VLM"])
-
-    subgraph genlip ["GenLIP · обучающий каркас"]
-        direction TB
-        FUSE["Early fusion"] --> ROPE["Interleaved mRoPE"]
-        ROPE --> ENC["Encoder · 27 слоёв<br/>prefix-LM"]
-        ENC --> LOSS["LM head<br/>next-token loss"]
-    end
-
-    classDef vision fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a,stroke-width:1.5px
-    classDef train fill:#fef3c7,stroke:#b45309,color:#78350f,stroke-width:1.5px
-    classDef deploy fill:#dcfce7,stroke:#15803d,color:#14532d,stroke-width:1.5px
-    classDef io fill:#f8fafc,stroke:#64748b,color:#0f172a,stroke-width:1.5px
-
-    class SN,PDF,PATCH,TOK,CTR vision
-    class FUSE,ROPE,ENC,LOSS train
-    class VLM deploy
-    class IMG,CAP io
-
-    style dartlip fill:#f8fbff,stroke:#93c5fd,stroke-width:1.5px
-    style genlip fill:#fffdf5,stroke:#fcd34d,stroke-width:1.5px
+flowchart LR
+    A[pixel_values] --> B[ScoreNet]
+    B --> C[PDF]
+    C --> D[row heights]
+    D --> E[edges]
+    E --> F[grid_sample]
+    F --> G[Conv2d]
+    G --> H["embeddings, centers"]
 ```
+
+`ScoreNet` — MobileNetV3 (`features[:17]`) и MLP. `row heights` и `edges` строятся из PDF, `grid_sample` вырезает патчи 16×16, `Conv2d` даёт `(B, N, 1152)` и центроиды `(B, N, 2)`.
+
+**Обучение** — [`vision/genlip/model.py`](vision/genlip/model.py)
+
+```mermaid
+flowchart LR
+    A["embeddings + input_ids"] --> B[EarlyFusion]
+    B --> C[mRoPE]
+    C --> D[GenLIPEncoder]
+    D --> E[lm_head]
+    E --> F[CE loss]
+```
+
+После обучения веса `ScoreNet` и `Conv2d` забираются во внешнюю VLM.
 
 | Компонент | Роль |
 |---|---|

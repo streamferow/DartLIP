@@ -7,7 +7,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from timm.layers import DropPath
 
-from transformer.interleaved_mrope import apply_rotary_embeddings, build_mrope_frequencies
+from .interleaved_mrope import apply_rotary_embeddings, build_mrope_frequencies
 from vision.tokenizer.dart import build_dart
 
 from .config import DARTConfig, ModelConfig

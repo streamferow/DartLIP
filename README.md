@@ -1,4 +1,4 @@
-# FlowVLM
+# DartLIP
 
 Vision-language модель для генерации подписей к изображениям. **DART** вырезает патчи с content-aware деформацией сетки, **GenLIP** склеивает их с текстом и учится предсказывать следующий токен подписи.
 
@@ -189,7 +189,7 @@ torchrun --nproc_per_node=1 -m vision.train.train --config vision/config_stage2.
 ## Структура репозитория
 
 ```
-FlowVLM/
+DartLIP/
 ├── vision/
 │   ├── config_stage1.yaml          # 224², 196 патчей
 │   ├── config_stage2.yaml          # AnyRes + patch-n-pack

@@ -20,32 +20,43 @@
 
 ## Архитектура
 
-```
-изображение
-    │
-    ▼
-DartLIP — визуальный энкодер
-    ScoreNet (MobileNetV3 + MLP)
-        │
-        ▼
-    PDF → высоты строк и границы патчей
-        │                    │
-        ▼                    ▼
-    патчи 16×16         центроиды (y, x)
-        │
-        ▼
-    Conv2d → токены (B, N, 1152)
-        │
-        ├──────────────────► внешняя VLM
-        │
-        ▼
-GenLIP — обучающий каркас
-    токены + подпись
-        │
-        ▼
-    early fusion → mRoPE → encoder → LM head → loss
-                     ▲
-                     └── центроиды патчей
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "ui-sans-serif, system-ui, sans-serif", "fontSize": "15px", "lineColor": "#64748b", "textColor": "#0f172a"}, "flowchart": {"curve": "basis", "padding": 14, "nodeSpacing": 32, "rankSpacing": 40}}}%%
+flowchart TB
+    IMG(["Изображение"]) --> SN
+
+    subgraph dartlip ["DartLIP · визуальный энкодер"]
+        direction TB
+        SN["ScoreNet<br/>MobileNetV3 + MLP"] --> PDF["PDF<br/>границы патчей"]
+        PDF --> PATCH["Патчи 16×16"]
+        PATCH --> TOK["Токены 1152"]
+        PDF --> CTR["Центроиды"]
+    end
+
+    CAP(["Подпись"]) --> FUSE
+    TOK --> FUSE
+    CTR --> ROPE
+    TOK -.->|"после обучения"| VLM(["Внешняя VLM"])
+
+    subgraph genlip ["GenLIP · обучающий каркас"]
+        direction TB
+        FUSE["Early fusion"] --> ROPE["Interleaved mRoPE"]
+        ROPE --> ENC["Encoder · 27 слоёв<br/>prefix-LM"]
+        ENC --> LOSS["LM head<br/>next-token loss"]
+    end
+
+    classDef vision fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a,stroke-width:1.5px
+    classDef train fill:#fef3c7,stroke:#b45309,color:#78350f,stroke-width:1.5px
+    classDef deploy fill:#dcfce7,stroke:#15803d,color:#14532d,stroke-width:1.5px
+    classDef io fill:#f8fafc,stroke:#64748b,color:#0f172a,stroke-width:1.5px
+
+    class SN,PDF,PATCH,TOK,CTR vision
+    class FUSE,ROPE,ENC,LOSS train
+    class VLM deploy
+    class IMG,CAP io
+
+    style dartlip fill:#f8fbff,stroke:#93c5fd,stroke-width:1.5px
+    style genlip fill:#fffdf5,stroke:#fcd34d,stroke-width:1.5px
 ```
 
 | Компонент | Роль |

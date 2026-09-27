@@ -20,28 +20,32 @@
 
 ## Архитектура
 
-```mermaid
-flowchart TB
-    IMG["Изображение"] --> DART
-    CAP["Подпись · Qwen3 tokenizer"] --> TEXT["Text embedding"]
-
-    subgraph DartLIP["DartLIP (визуальный энкодер)"]
-        SN["ScoreNet\nMobileNetV3 + MLP"] --> PDF["PDF → row heights → edges"]
-        PDF --> SAMPLE["grid_sample · патчи 16×16"]
-        SAMPLE --> PROJ["Conv2d → 1152d"]
-        PDF --> CENTERS["центроиды патчей"]
-    end
-
-    PROJ --> MERGE["Spatial merger"]
-    MERGE --> FUSE["Early fusion\nvision ∥ text"]
-    TEXT --> FUSE
-    CENTERS --> ROPE["Interleaved mRoPE"]
-    FUSE --> ENC["GenLIP encoder · 27 слоёв\nprefix-LM · flex attention"]
-    ROPE --> ENC
-    ENC --> HEAD["LM head"]
-    HEAD --> LOSS["Cross-entropy\nnext-token loss"]
-
-    PROJ -.->|"после обучения"| VLM["Внешняя VLM"]
+```
+изображение
+    │
+    ▼
+DartLIP — визуальный энкодер
+    ScoreNet (MobileNetV3 + MLP)
+        │
+        ▼
+    PDF → высоты строк и границы патчей
+        │                    │
+        ▼                    ▼
+    патчи 16×16         центроиды (y, x)
+        │
+        ▼
+    Conv2d → токены (B, N, 1152)
+        │
+        ├──────────────────► внешняя VLM
+        │
+        ▼
+GenLIP — обучающий каркас
+    токены + подпись
+        │
+        ▼
+    early fusion → mRoPE → encoder → LM head → loss
+                     ▲
+                     └── центроиды патчей
 ```
 
 | Компонент | Роль |
